@@ -43,6 +43,12 @@ builder.Services.AddAuthorization();
 
 builder.Services.AddMassTransit(x =>
 {
+    // Prefixed so this service's receive endpoint names never collide with another service's
+    // consumer of the same class name on the shared RabbitMQ vhost (e.g. PaymentProcessedEventConsumer
+    // also exists in ArcadeLink.Notifications) — without this, MassTransit's default endpoint naming
+    // would give both services literally the same queue, turning fan-out into competing consumers.
+    x.SetEndpointNameFormatter(new KebabCaseEndpointNameFormatter("catalog", false));
+
     x.AddConsumer<PaymentProcessedEventConsumer>();
 
     x.UsingRabbitMq((context, cfg) =>
