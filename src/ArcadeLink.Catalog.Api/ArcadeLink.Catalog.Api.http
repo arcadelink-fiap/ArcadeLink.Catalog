@@ -1,6 +1,26 @@
 @ArcadeLink.Catalog.Api_HostAddress = http://localhost:5201
 
-GET {{ArcadeLink.Catalog.Api_HostAddress}}/weatherforecast/
-Accept: application/json
+### Listar jogos (público)
+GET {{ArcadeLink.Catalog.Api_HostAddress}}/games
+
+### Criar jogo (requer Bearer token de um Admin)
+POST {{ArcadeLink.Catalog.Api_HostAddress}}/games
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{
+  "title": "Hollow Knight",
+  "description": "Metroidvania",
+  "genre": "Ação",
+  "price": 29.90
+}
+
+### Biblioteca do usuário logado
+GET {{ArcadeLink.Catalog.Api_HostAddress}}/library
+Authorization: Bearer {{token}}
+
+### Comprar um jogo
+POST {{ArcadeLink.Catalog.Api_HostAddress}}/games/{{gameId}}/purchase
+Authorization: Bearer {{token}}
 
 ###
