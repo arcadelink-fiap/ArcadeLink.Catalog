@@ -2,6 +2,7 @@ using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
 using ArcadeLink.Catalog.Api.Auth;
+using ArcadeLink.Catalog.Api.Caching;
 using ArcadeLink.Catalog.Api.Consumers;
 using ArcadeLink.Catalog.Api.Data;
 using ArcadeLink.Catalog.Api.Domain;
@@ -11,8 +12,10 @@ using MassTransit;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
+using MongoDB.Driver;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -53,6 +56,13 @@ builder.Services.AddSwaggerGen(options =>
 
 builder.Services.AddDbContext<CatalogDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("Postgres")));
+
+builder.Services.AddSingleton<IMongoClient>(_ =>
+    new MongoClient(builder.Configuration["Mongo:ConnectionString"]));
+builder.Services.AddScoped<IGameDetailsRepository, GameDetailsRepository>();
+
+builder.Services.AddStackExchangeRedisCache(options =>
+    options.Configuration = builder.Configuration["Redis:ConnectionString"]);
 
 var jwtOptions = builder.Configuration.GetSection(JwtOptions.SectionName).Get<JwtOptions>()
     ?? throw new InvalidOperationException("Missing Jwt configuration section.");
@@ -131,23 +141,50 @@ app.UseHttpsRedirection();
 app.UseAuthentication();
 app.UseAuthorization();
 
-app.MapGet("/games", async (CatalogDbContext db) =>
+app.MapGet("/games", async (CatalogDbContext db, IDistributedCache cache) =>
 {
+    var cached = await JsonDistributedCache.GetAsync<List<GameResponse>>(cache, "games:all");
+    if (cached is not null)
+        return Results.Ok(cached);
+
     var games = await db.Games.OrderBy(g => g.Title).ToListAsync();
-    return Results.Ok(games.Select(ToResponse));
+    var response = games.Select(g => GameResponseMapper.ToResponse(g)).ToList();
+    await JsonDistributedCache.SetAsync(cache, "games:all", response, TimeSpan.FromSeconds(60));
+    return Results.Ok(response);
 })
 .WithName("ListGames")
 .WithOpenApi();
 
-app.MapGet("/games/{id:guid}", async (Guid id, CatalogDbContext db) =>
+app.MapGet("/games/{id:guid}", async (
+    Guid id,
+    CatalogDbContext db,
+    IGameDetailsRepository detailsRepo,
+    ILogger<Program> logger,
+    IDistributedCache cache) =>
 {
+    var cacheKey = $"games:{id}";
+    var cached = await JsonDistributedCache.GetAsync<GameResponse>(cache, cacheKey);
+    if (cached is not null)
+        return Results.Ok(cached);
+
     var game = await db.Games.FindAsync(id);
-    return game is null ? Results.NotFound() : Results.Ok(ToResponse(game));
+    if (game is null)
+        return Results.NotFound();
+
+    var details = await GameDetailsSync.TryGetAsync(detailsRepo, logger, id);
+    var response = GameResponseMapper.ToResponse(game, details);
+    await JsonDistributedCache.SetAsync(cache, cacheKey, response, TimeSpan.FromSeconds(60));
+    return Results.Ok(response);
 })
 .WithName("GetGame")
 .WithOpenApi();
 
-app.MapPost("/games", async (GameRequest request, CatalogDbContext db) =>
+app.MapPost("/games", async (
+    GameRequest request,
+    CatalogDbContext db,
+    IGameDetailsRepository detailsRepo,
+    ILogger<Program> logger,
+    IDistributedCache cache) =>
 {
     if (string.IsNullOrWhiteSpace(request.Title))
         return Results.ValidationProblem(new Dictionary<string, string[]> { ["title"] = ["Title is required."] });
@@ -168,13 +205,24 @@ app.MapPost("/games", async (GameRequest request, CatalogDbContext db) =>
     db.Games.Add(game);
     await db.SaveChangesAsync();
 
-    return Results.Created($"/games/{game.Id}", ToResponse(game));
+    var details = await SyncGameDetailsIfProvided(request, game.Id, detailsRepo, logger);
+
+    await cache.RemoveAsync("games:all");
+    await cache.RemoveAsync($"games:{game.Id}");
+
+    return Results.Created($"/games/{game.Id}", GameResponseMapper.ToResponse(game, details));
 })
 .RequireAuthorization(policy => policy.RequireRole(Roles.Admin))
 .WithName("CreateGame")
 .WithOpenApi();
 
-app.MapPut("/games/{id:guid}", async (Guid id, GameRequest request, CatalogDbContext db) =>
+app.MapPut("/games/{id:guid}", async (
+    Guid id,
+    GameRequest request,
+    CatalogDbContext db,
+    IGameDetailsRepository detailsRepo,
+    ILogger<Program> logger,
+    IDistributedCache cache) =>
 {
     var game = await db.Games.FindAsync(id);
     if (game is null)
@@ -193,13 +241,18 @@ app.MapPut("/games/{id:guid}", async (Guid id, GameRequest request, CatalogDbCon
 
     await db.SaveChangesAsync();
 
-    return Results.Ok(ToResponse(game));
+    var details = await SyncGameDetailsIfProvided(request, game.Id, detailsRepo, logger);
+
+    await cache.RemoveAsync("games:all");
+    await cache.RemoveAsync($"games:{game.Id}");
+
+    return Results.Ok(GameResponseMapper.ToResponse(game, details));
 })
 .RequireAuthorization(policy => policy.RequireRole(Roles.Admin))
 .WithName("UpdateGame")
 .WithOpenApi();
 
-app.MapDelete("/games/{id:guid}", async (Guid id, CatalogDbContext db) =>
+app.MapDelete("/games/{id:guid}", async (Guid id, CatalogDbContext db, IDistributedCache cache) =>
 {
     var game = await db.Games.FindAsync(id);
     if (game is null)
@@ -207,6 +260,9 @@ app.MapDelete("/games/{id:guid}", async (Guid id, CatalogDbContext db) =>
 
     db.Games.Remove(game);
     await db.SaveChangesAsync();
+
+    await cache.RemoveAsync("games:all");
+    await cache.RemoveAsync($"games:{id}");
 
     return Results.NoContent();
 })
@@ -269,5 +325,19 @@ static Guid GetUserId(ClaimsPrincipal user)
     return Guid.Parse(value!);
 }
 
-static GameResponse ToResponse(Game game) =>
-    new(game.Id, game.Title, game.Description, game.Genre, game.Price, game.CreatedAtUtc);
+static async Task<GameDetails?> SyncGameDetailsIfProvided(
+    GameRequest request, Guid gameId, IGameDetailsRepository detailsRepo, ILogger logger)
+{
+    if (request.RichDescription is null && request.Tags is null && request.Screenshots is null)
+        return null;
+
+    var details = new GameDetails
+    {
+        GameId = gameId,
+        RichDescription = request.RichDescription,
+        Tags = request.Tags ?? new List<string>(),
+        Screenshots = request.Screenshots ?? new List<string>()
+    };
+    await GameDetailsSync.TryUpsertAsync(detailsRepo, logger, details);
+    return details;
+}
