@@ -15,8 +15,36 @@ microsserviços orientada a eventos do FIAP Cloud Games (FCG) — Tech Challenge
 | GET | `/library` | Qualquer usuário autenticado | Lista os jogos da biblioteca do usuário logado (`sub` do JWT). |
 | POST | `/games/{id}/purchase` | Qualquer usuário autenticado | Inicia a compra: publica `OrderPlacedEvent` (não adiciona o jogo ainda). Retorna 409 se o usuário já possui o jogo. |
 
-O JWT validado aqui é o mesmo emitido pelo `ArcadeLink.Users` — `Jwt:Issuer`/`Jwt:Audience`/`Jwt:Key`
-precisam ser idênticos entre os dois serviços (ver Etapa 6 do plano).
+## Autenticação via Gateway
+
+A partir da Fase 3, este serviço **não valida JWT nenhum**. `GET /games`/`GET /games/{id}`
+continuam públicos; `POST`/`PUT`/`DELETE /games`, `GET /library` e `POST /games/{id}/purchase`
+agora confiam nos headers `X-User-Id`/`X-User-Role` injetados pelo API Gateway (Kong) depois de ele
+validar o JWT — ver `src/ArcadeLink.Catalog.Api/Auth/KongHeaderAuthenticationHandler.cs` e
+`Auth/KongHeaderPrincipalBuilder.cs`.
+
+Fora do Kong (dev local direto, `dotnet run`/compose), simule a autenticação passando esses dois
+headers manualmente em vez de um Bearer token:
+
+```
+X-User-Id: <guid do usuário>
+X-User-Role: Admin
+```
+
+## Persistência poliglota (MongoDB)
+
+`GET /games/{id}` combina o `Game` do Postgres com um documento `GameDetails` opcional no MongoDB
+(`RichDescription`, `Tags`, `Screenshots`) — um enriquecimento de leitura, não crítico ao fluxo de
+compra (o Postgres continua sendo a fonte da verdade de existência/preço). `POST`/`PUT /games`
+aceitam esses três campos opcionalmente no corpo da requisição para popular o Mongo junto com a
+escrita no Postgres. Uma falha no Mongo nunca derruba a resposta — é best-effort, ver
+`Data/GameDetailsSync.cs` (`TryUpsertAsync`/`TryGetAsync` capturam qualquer exceção e logam um
+warning em vez de propagar).
+
+## Cache (Redis)
+
+`GET /games` e `GET /games/{id}` usam cache-aside com TTL de 60s (chaves `games:all` e
+`games:{id}`); qualquer escrita (`POST`/`PUT`/`DELETE /games`) invalida as chaves afetadas.
 
 ## Como rodar localmente
 
@@ -41,12 +69,12 @@ compose, k8s), use a sintaxe de variável de ambiente do ASP.NET Core (`__` no l
 | Variável de ambiente | Descrição | Exemplo |
 |---|---|---|
 | `ConnectionStrings__Postgres` | Connection string do Postgres (`arcadelink_catalog`). | `Host=postgres;Port=5432;Database=arcadelink_catalog;Username=postgres;Password=postgres` |
-| `Jwt__Issuer` | Issuer esperado do JWT — **precisa bater** com o emitido pelo Users. | `ArcadeLink.Users` |
-| `Jwt__Audience` | Audience esperada do JWT — **precisa bater** com o Users. | `ArcadeLink` |
-| `Jwt__Key` | Chave de assinatura para validar o JWT — **idêntica** à do Users (Etapa 6). | `dev-only-change-me-arcadelink-shared-jwt-signing-key-32bytes-min` |
 | `RabbitMq__Host` | Host do broker. | `localhost` (dev) / `rabbitmq` (compose/k8s) |
 | `RabbitMq__Username` | Usuário do broker. | `guest` |
 | `RabbitMq__Password` | Senha do broker. | `guest` |
+| `Mongo__ConnectionString` | Connection string do MongoDB. | `mongodb://localhost:27017` (dev) / `mongodb://mongodb:27017` (k8s) |
+| `Mongo__Database` | Nome do banco Mongo. | `arcadelink_catalog` |
+| `Redis__ConnectionString` | Connection string do Redis (cache de consultas de jogos). | `localhost:6379` (dev) / `redis:6379` (k8s) |
 
 ## Idempotência da biblioteca
 
@@ -84,15 +112,20 @@ para instruções completas.
 
 Manifestos em `k8s/` (`deployment.yaml`, `service.yaml`, `configmap.yaml`, `secret.yaml`) —
 `Deployment` usa `image: localhost/arcadelink-catalog:latest` com `imagePullPolicy: Never` (sem
-registry, precisa ser carregada localmente no cluster antes do `kubectl apply`), `Service` expõe
-`port: 80` → `targetPort: 8080`. Config não sensível (`Jwt:Issuer`/`Audience`, `RabbitMq:Host`/
-`Username`) em `ConfigMap`; sensível (`ConnectionStrings:Postgres`, `Jwt:Key`, `RabbitMq:Password`)
-em `Secret`.
+registry, precisa ser carregada localmente no cluster antes do `kubectl apply`), `Service` (tipo
+`ClusterIP`) expõe `port: 80` → `targetPort: 8080`. `RabbitMq:Host`/`Username` em `ConfigMap`;
+`ConnectionStrings:Postgres`/`RabbitMq:Password` em `Secret`.
+
+Os manifestos (`configmap.yaml`/`secret.yaml`) já incluem `Mongo__ConnectionString`/`Mongo__Database`/
+`Redis__ConnectionString`, apontando para os Services `mongodb`/`redis` do
+`ArcadeLink.Orchestration` — nenhuma edição manual é necessária antes de aplicar.
 
 Os manifestos de infraestrutura compartilhada (Postgres, RabbitMQ) ficam no repo âncora,
-`ArcadeLink.Users/k8s/` — veja o
-[README do ArcadeLink.Users](../ArcadeLink.Users/README.md#kubernetes) para o passo a passo completo
-(build das imagens, carregar no cluster local, ordem de `kubectl apply`).
+`ArcadeLink.Users/k8s/`; os de Redis, MongoDB, Prometheus/Grafana e Kong ficam no
+`ArcadeLink.Orchestration` — veja o
+[README do ArcadeLink.Users](../ArcadeLink.Users/README.md#kubernetes) e o
+[README do ArcadeLink.Orchestration](../ArcadeLink.Orchestration/README.md) para o passo a passo
+completo (build das imagens, carregar no cluster local, ordem de `kubectl apply`).
 
 ## Testes
 
@@ -100,11 +133,16 @@ Os manifestos de infraestrutura compartilhada (Postgres, RabbitMQ) ficam no repo
 dotnet test
 ```
 
-`tests/ArcadeLink.Catalog.Api.Tests` (xUnit, 3 testes): `PaymentProcessedEventConsumerTests`, usando
-`AddMassTransitTestHarness` (bus in-memory) + `Microsoft.EntityFrameworkCore.InMemory` para o
+`tests/ArcadeLink.Catalog.Api.Tests` (xUnit, 16 testes): os 3 originais — `PaymentProcessedEventConsumerTests`,
+usando `AddMassTransitTestHarness` (bus in-memory) + `Microsoft.EntityFrameworkCore.InMemory` para o
 `CatalogDbContext` — cobre `Approved` adiciona à biblioteca, `Rejected` não adiciona nada, e
-reprocessar um jogo já possuído não duplica (a idempotência descrita acima). Não precisa de
-Postgres/RabbitMQ rodando.
+reprocessar um jogo já possuído não duplica (a idempotência descrita acima) — mais quatro grupos
+novos da Fase 3: `GameDetailsSyncTests` (comportamento best-effort do enriquecimento via Mongo,
+inclusive quando o repositório lança exceção), `GameResponseMapperTests` (combinação do `Game` do
+Postgres com o `GameDetails` opcional do Mongo na resposta), `JsonDistributedCacheTests`
+(serialização JSON do cache do Redis) e `KongHeaderPrincipalBuilderTests` (construção do
+`ClaimsPrincipal` a partir dos headers `X-User-Id`/`X-User-Role`). Não precisa de
+Postgres/RabbitMQ/Mongo/Redis rodando.
 
 ## Contratos de eventos
 

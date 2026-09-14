@@ -1,6 +1,5 @@
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
-using System.Text;
 using ArcadeLink.Catalog.Api.Auth;
 using ArcadeLink.Catalog.Api.Caching;
 using ArcadeLink.Catalog.Api.Consumers;
@@ -9,11 +8,10 @@ using ArcadeLink.Catalog.Api.Domain;
 using ArcadeLink.Catalog.Api.Models;
 using ArcadeLink.Contracts;
 using MassTransit;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Distributed;
-using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using MongoDB.Driver;
 using Prometheus;
@@ -65,23 +63,9 @@ builder.Services.AddScoped<IGameDetailsRepository, GameDetailsRepository>();
 builder.Services.AddStackExchangeRedisCache(options =>
     options.Configuration = builder.Configuration["Redis:ConnectionString"]);
 
-var jwtOptions = builder.Configuration.GetSection(JwtOptions.SectionName).Get<JwtOptions>()
-    ?? throw new InvalidOperationException("Missing Jwt configuration section.");
-
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options =>
-    {
-        options.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuer = true,
-            ValidateAudience = true,
-            ValidateLifetime = true,
-            ValidateIssuerSigningKey = true,
-            ValidIssuer = jwtOptions.Issuer,
-            ValidAudience = jwtOptions.Audience,
-            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtOptions.Key))
-        };
-    });
+builder.Services.AddAuthentication(KongHeaderPrincipalBuilder.SchemeName)
+    .AddScheme<AuthenticationSchemeOptions, KongHeaderAuthenticationHandler>(
+        KongHeaderPrincipalBuilder.SchemeName, options => { });
 
 builder.Services.AddAuthorization();
 

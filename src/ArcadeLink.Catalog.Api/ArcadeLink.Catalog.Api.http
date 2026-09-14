@@ -1,12 +1,15 @@
 @ArcadeLink.Catalog.Api_HostAddress = http://localhost:5201
+@Kong_HostAddress = http://localhost:8000
+@userId = 00000000-0000-0000-0000-000000000000
 
 ### Listar jogos (público)
 GET {{ArcadeLink.Catalog.Api_HostAddress}}/games
 
-### Criar jogo (requer Bearer token de um Admin)
+### Criar jogo (requer X-User-Id/X-User-Role de um Admin — o serviço não lê mais Authorization)
 POST {{ArcadeLink.Catalog.Api_HostAddress}}/games
 Content-Type: application/json
-Authorization: Bearer {{adminToken}}
+X-User-Id: {{userId}}
+X-User-Role: Admin
 
 {
   "title": "Hollow Knight",
@@ -17,10 +20,37 @@ Authorization: Bearer {{adminToken}}
 
 ### Biblioteca do usuário logado
 GET {{ArcadeLink.Catalog.Api_HostAddress}}/library
-Authorization: Bearer {{token}}
+X-User-Id: {{userId}}
+X-User-Role: User
 
 ### Comprar um jogo
 POST {{ArcadeLink.Catalog.Api_HostAddress}}/games/{{gameId}}/purchase
+X-User-Id: {{userId}}
+X-User-Role: User
+
+### === A partir daqui: mesmos endpoints através do Kong ===
+
+### [Kong] Listar jogos — rota pública, sem JWT
+GET {{Kong_HostAddress}}/games
+
+### [Kong] Criar jogo — rota protegida (Admin)
+POST {{Kong_HostAddress}}/games
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{
+  "title": "Hollow Knight",
+  "description": "Metroidvania",
+  "genre": "Ação",
+  "price": 29.90
+}
+
+### [Kong] Biblioteca do usuário logado — rota protegida
+GET {{Kong_HostAddress}}/library
+Authorization: Bearer {{token}}
+
+### [Kong] Comprar um jogo — rota protegida (mesmo prefixo /games da rota "catalog-protected" do Kong)
+POST {{Kong_HostAddress}}/games/{{gameId}}/purchase
 Authorization: Bearer {{token}}
 
 ###

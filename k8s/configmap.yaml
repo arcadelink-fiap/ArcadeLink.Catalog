@@ -4,7 +4,8 @@ metadata:
   name: catalog-api-config
 data:
   ASPNETCORE_ENVIRONMENT: "Development"
-  Jwt__Issuer: "ArcadeLink.Users"
-  Jwt__Audience: "ArcadeLink"
   RabbitMq__Host: "rabbitmq"
   RabbitMq__Username: "guest"
+  Mongo__ConnectionString: "mongodb://mongodb:27017"
+  Mongo__Database: "arcadelink_catalog"
+  Redis__ConnectionString: "redis:6379"
