@@ -16,6 +16,7 @@ using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using MongoDB.Driver;
+using Prometheus;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -138,8 +139,10 @@ app.UseExceptionHandler(errorApp =>
 });
 
 app.UseHttpsRedirection();
+app.UseHttpMetrics();
 app.UseAuthentication();
 app.UseAuthorization();
+app.MapMetrics();
 
 app.MapGet("/games", async (CatalogDbContext db, IDistributedCache cache) =>
 {
