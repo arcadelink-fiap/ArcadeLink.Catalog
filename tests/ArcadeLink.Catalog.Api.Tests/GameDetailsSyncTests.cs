@@ -11,6 +11,7 @@ public class GameDetailsSyncTests
     {
         public Task<GameDetails?> GetByGameIdAsync(Guid gameId) => throw new NotImplementedException();
         public Task UpsertAsync(GameDetails details) => throw new InvalidOperationException("mongo down");
+        public Task DeleteByGameIdAsync(Guid gameId) => throw new InvalidOperationException("mongo down");
     }
 
     private class InMemoryRepository : IGameDetailsRepository
@@ -18,6 +19,11 @@ public class GameDetailsSyncTests
         public GameDetails? Saved { get; private set; }
         public Task<GameDetails?> GetByGameIdAsync(Guid gameId) => Task.FromResult(Saved);
         public Task UpsertAsync(GameDetails details) { Saved = details; return Task.CompletedTask; }
+        public Task DeleteByGameIdAsync(Guid gameId)
+        {
+            if (Saved?.GameId == gameId) Saved = null;
+            return Task.CompletedTask;
+        }
     }
 
     [Fact]
@@ -66,5 +72,26 @@ public class GameDetailsSyncTests
         var result = await GameDetailsSync.TryGetAsync(repository, NullLogger.Instance, details.GameId);
 
         Assert.Equal(details, result);
+    }
+
+    [Fact]
+    public async Task Delete_failure_does_not_throw()
+    {
+        var exception = await Record.ExceptionAsync(() =>
+            GameDetailsSync.TryDeleteAsync(new ThrowingRepository(), NullLogger.Instance, Guid.NewGuid()));
+
+        Assert.Null(exception);
+    }
+
+    [Fact]
+    public async Task Delete_removes_details()
+    {
+        var repository = new InMemoryRepository();
+        var details = new GameDetails { GameId = Guid.NewGuid(), RichDescription = "x" };
+        await repository.UpsertAsync(details);
+
+        await GameDetailsSync.TryDeleteAsync(repository, NullLogger.Instance, details.GameId);
+
+        Assert.Null(repository.Saved);
     }
 }

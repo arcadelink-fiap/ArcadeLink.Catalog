@@ -6,6 +6,9 @@ using ArcadeLink.Catalog.Api.Consumers;
 using ArcadeLink.Catalog.Api.Data;
 using ArcadeLink.Catalog.Api.Domain;
 using ArcadeLink.Catalog.Api.Models;
+using ArcadeLink.Catalog.Api.Health;
+using ArcadeLink.Catalog.Api.Messaging;
+using ArcadeLink.Catalog.Api.Search;
 using ArcadeLink.Contracts;
 using MassTransit;
 using Microsoft.AspNetCore.Authentication;
@@ -60,6 +63,12 @@ builder.Services.AddSingleton<IMongoClient>(_ =>
     new MongoClient(builder.Configuration["Mongo:ConnectionString"]));
 builder.Services.AddScoped<IGameDetailsRepository, GameDetailsRepository>();
 
+builder.Services.Configure<SearchOptions>(builder.Configuration.GetSection(SearchOptions.SectionName));
+if (string.IsNullOrWhiteSpace(builder.Configuration[$"{SearchOptions.SectionName}:Endpoint"]))
+    builder.Services.AddSingleton<IGameSearchService, DisabledGameSearchService>();
+else
+    builder.Services.AddSingleton<IGameSearchService, OpenSearchGameSearchService>();
+
 builder.Services.AddStackExchangeRedisCache(options =>
     options.Configuration = builder.Configuration["Redis:ConnectionString"]);
 
@@ -69,33 +78,24 @@ builder.Services.AddAuthentication(KongHeaderPrincipalBuilder.SchemeName)
 
 builder.Services.AddAuthorization();
 
-builder.Services.AddMassTransit(x =>
-{
-    // Prefixed so this service's receive endpoint names never collide with another service's
-    // consumer of the same class name on the shared RabbitMQ vhost (e.g. PaymentProcessedEventConsumer
-    // also exists in ArcadeLink.Notifications) — without this, MassTransit's default endpoint naming
-    // would give both services literally the same queue, turning fan-out into competing consumers.
-    x.SetEndpointNameFormatter(new KebabCaseEndpointNameFormatter("catalog", false));
-
-    x.AddConsumer<PaymentProcessedEventConsumer>();
-
-    x.UsingRabbitMq((context, cfg) =>
-    {
-        cfg.Host(builder.Configuration["RabbitMq:Host"], "/", h =>
-        {
-            h.Username(builder.Configuration["RabbitMq:Username"]!);
-            h.Password(builder.Configuration["RabbitMq:Password"]!);
-        });
-
-        cfg.ConfigureEndpoints(context);
-    });
-});
+// Prefixo "catalog" nos receive endpoints: evita colisão de fila com o PaymentProcessedEventConsumer de
+// ArcadeLink.Notifications no mesmo vhost (ver comentário em AddArcadeLinkMessaging).
+builder.Services.AddArcadeLinkMessaging(builder.Configuration, "catalog", x => x.AddConsumer<PaymentProcessedEventConsumer>());
 
 var app = builder.Build();
 
 using (var scope = app.Services.CreateScope())
 {
     scope.ServiceProvider.GetRequiredService<CatalogDbContext>().Database.Migrate();
+}
+
+try
+{
+    await app.Services.GetRequiredService<IGameSearchService>().EnsureIndexAsync();
+}
+catch (Exception ex)
+{
+    app.Logger.LogWarning(ex, "Não foi possível garantir o índice de busca no OpenSearch — o Catalog segue sem busca até ele ficar disponível");
 }
 
 if (app.Environment.IsDevelopment())
@@ -128,15 +128,22 @@ app.UseAuthentication();
 app.UseAuthorization();
 app.MapMetrics();
 
-app.MapGet("/games", async (CatalogDbContext db, IDistributedCache cache) =>
+app.MapGet("/games", async (
+    HttpContext http,
+    CatalogDbContext db,
+    ILogger<Program> logger,
+    IDistributedCache cache) =>
 {
-    var cached = await JsonDistributedCache.GetAsync<List<GameResponse>>(cache, "games:all");
-    if (cached is not null)
-        return Results.Ok(cached);
+    var (response, result) = await CachedQuery.GetOrCreateAsync<List<GameResponse>>(
+        cache, "games:all", TimeSpan.FromSeconds(60),
+        async () =>
+        {
+            var games = await db.Games.OrderBy(g => g.Title).ToListAsync();
+            return games.Select(g => GameResponseMapper.ToResponse(g)).ToList();
+        },
+        logger);
 
-    var games = await db.Games.OrderBy(g => g.Title).ToListAsync();
-    var response = games.Select(g => GameResponseMapper.ToResponse(g)).ToList();
-    await JsonDistributedCache.SetAsync(cache, "games:all", response, TimeSpan.FromSeconds(60));
+    http.Response.Headers[CachedQuery.HeaderName] = CachedQuery.ToHeaderValue(result);
     return Results.Ok(response);
 })
 .WithName("ListGames")
@@ -144,24 +151,27 @@ app.MapGet("/games", async (CatalogDbContext db, IDistributedCache cache) =>
 
 app.MapGet("/games/{id:guid}", async (
     Guid id,
+    HttpContext http,
     CatalogDbContext db,
     IGameDetailsRepository detailsRepo,
     ILogger<Program> logger,
     IDistributedCache cache) =>
 {
-    var cacheKey = $"games:{id}";
-    var cached = await JsonDistributedCache.GetAsync<GameResponse>(cache, cacheKey);
-    if (cached is not null)
-        return Results.Ok(cached);
+    var (response, result) = await CachedQuery.GetOrCreateAsync<GameResponse>(
+        cache, $"games:{id}", TimeSpan.FromSeconds(60),
+        async () =>
+        {
+            var game = await db.Games.FindAsync(id);
+            if (game is null)
+                return null;
 
-    var game = await db.Games.FindAsync(id);
-    if (game is null)
-        return Results.NotFound();
+            var details = await GameDetailsSync.TryGetAsync(detailsRepo, logger, id);
+            return GameResponseMapper.ToResponse(game, details);
+        },
+        logger);
 
-    var details = await GameDetailsSync.TryGetAsync(detailsRepo, logger, id);
-    var response = GameResponseMapper.ToResponse(game, details);
-    await JsonDistributedCache.SetAsync(cache, cacheKey, response, TimeSpan.FromSeconds(60));
-    return Results.Ok(response);
+    http.Response.Headers[CachedQuery.HeaderName] = CachedQuery.ToHeaderValue(result);
+    return response is null ? Results.NotFound() : Results.Ok(response);
 })
 .WithName("GetGame")
 .WithOpenApi();
@@ -170,6 +180,7 @@ app.MapPost("/games", async (
     GameRequest request,
     CatalogDbContext db,
     IGameDetailsRepository detailsRepo,
+    IGameSearchService search,
     ILogger<Program> logger,
     IDistributedCache cache) =>
 {
@@ -193,9 +204,10 @@ app.MapPost("/games", async (
     await db.SaveChangesAsync();
 
     var details = await SyncGameDetailsIfProvided(request, game.Id, detailsRepo, logger);
+    await GameSearchSync.TryIndexAsync(search, logger,
+        GameSearchDocumentMapper.From(game, details ?? await GameDetailsSync.TryGetAsync(detailsRepo, logger, game.Id)));
 
-    await cache.RemoveAsync("games:all");
-    await cache.RemoveAsync($"games:{game.Id}");
+    await CachedQuery.TryRemoveAsync(cache, logger, "games:all", $"games:{game.Id}");
 
     return Results.Created($"/games/{game.Id}", GameResponseMapper.ToResponse(game, details));
 })
@@ -208,6 +220,7 @@ app.MapPut("/games/{id:guid}", async (
     GameRequest request,
     CatalogDbContext db,
     IGameDetailsRepository detailsRepo,
+    IGameSearchService search,
     ILogger<Program> logger,
     IDistributedCache cache) =>
 {
@@ -229,9 +242,10 @@ app.MapPut("/games/{id:guid}", async (
     await db.SaveChangesAsync();
 
     var details = await SyncGameDetailsIfProvided(request, game.Id, detailsRepo, logger);
+    await GameSearchSync.TryIndexAsync(search, logger,
+        GameSearchDocumentMapper.From(game, details ?? await GameDetailsSync.TryGetAsync(detailsRepo, logger, game.Id)));
 
-    await cache.RemoveAsync("games:all");
-    await cache.RemoveAsync($"games:{game.Id}");
+    await CachedQuery.TryRemoveAsync(cache, logger, "games:all", $"games:{game.Id}");
 
     return Results.Ok(GameResponseMapper.ToResponse(game, details));
 })
@@ -239,7 +253,13 @@ app.MapPut("/games/{id:guid}", async (
 .WithName("UpdateGame")
 .WithOpenApi();
 
-app.MapDelete("/games/{id:guid}", async (Guid id, CatalogDbContext db, IDistributedCache cache) =>
+app.MapDelete("/games/{id:guid}", async (
+    Guid id,
+    CatalogDbContext db,
+    IGameDetailsRepository detailsRepo,
+    IGameSearchService search,
+    ILogger<Program> logger,
+    IDistributedCache cache) =>
 {
     var game = await db.Games.FindAsync(id);
     if (game is null)
@@ -248,13 +268,31 @@ app.MapDelete("/games/{id:guid}", async (Guid id, CatalogDbContext db, IDistribu
     db.Games.Remove(game);
     await db.SaveChangesAsync();
 
-    await cache.RemoveAsync("games:all");
-    await cache.RemoveAsync($"games:{id}");
+    await GameDetailsSync.TryDeleteAsync(detailsRepo, logger, id);
+    await GameSearchSync.TryDeleteAsync(search, logger, id);
+    await CachedQuery.TryRemoveAsync(cache, logger, "games:all", $"games:{id}");
 
     return Results.NoContent();
 })
 .RequireAuthorization(policy => policy.RequireRole(Roles.Admin))
 .WithName("DeleteGame")
+.WithOpenApi();
+
+app.MapGet("/search", (
+    string? q, int? page, int? size,
+    IGameSearchService search,
+    ILogger<Program> logger,
+    CancellationToken ct) => SearchEndpoint.HandleAsync(q, page, size, search, logger, ct))
+.WithName("SearchGames")
+.WithOpenApi();
+
+app.MapPost("/admin/search/reindex", (
+    CatalogDbContext db,
+    IGameDetailsRepository detailsRepo,
+    IGameSearchService search,
+    ILogger<Program> logger) => SearchEndpoint.ReindexAsync(db, detailsRepo, search, logger))
+.RequireAuthorization(policy => policy.RequireRole(Roles.Admin))
+.WithName("ReindexSearch")
 .WithOpenApi();
 
 app.MapGet("/library", async (ClaimsPrincipal user, CatalogDbContext db) =>
@@ -303,6 +341,9 @@ app.MapPost("/games/{id:guid}/purchase", async (
 .RequireAuthorization()
 .WithName("PurchaseGame")
 .WithOpenApi();
+
+app.MapGet("/health", (IConfiguration configuration) => Results.Ok(HealthInfo.Create(configuration, "catalog-api")))
+    .WithName("Health");
 
 app.Run();
 

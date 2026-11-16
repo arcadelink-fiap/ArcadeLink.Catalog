@@ -2,10 +2,10 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: catalog-api-config
+  namespace: arcadelink
 data:
-  ASPNETCORE_ENVIRONMENT: "Development"
+  ASPNETCORE_ENVIRONMENT: "Production"
   RabbitMq__Host: "rabbitmq"
-  RabbitMq__Username: "guest"
-  Mongo__ConnectionString: "mongodb://mongodb:27017"
   Mongo__Database: "arcadelink_catalog"
-  Redis__ConnectionString: "redis:6379"
+  Search__IndexName: "games"
+  Search__UseAwsSigV4: "true"

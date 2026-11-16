@@ -21,4 +21,7 @@ public class GameDetailsRepository : IGameDetailsRepository
             d => d.GameId == details.GameId,
             details,
             new ReplaceOptions { IsUpsert = true });
+
+    public async Task DeleteByGameIdAsync(Guid gameId) =>
+        await _collection.DeleteOneAsync(d => d.GameId == gameId);
 }
