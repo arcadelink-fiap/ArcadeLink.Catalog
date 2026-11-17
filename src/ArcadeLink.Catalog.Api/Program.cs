@@ -342,7 +342,7 @@ app.MapPost("/games/{id:guid}/purchase", async (
 .WithName("PurchaseGame")
 .WithOpenApi();
 
-app.MapGet("/health", (IConfiguration configuration) => Results.Ok(HealthInfo.Create(configuration, "catalog-api")))
+app.MapGet("/health", (IConfiguration configuration) => Results.Ok(HealthInfo.Create(configuration, "catalog-api ao vivo")))
     .WithName("Health");
 
 app.Run();
