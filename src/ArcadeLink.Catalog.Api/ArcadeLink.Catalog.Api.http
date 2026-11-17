@@ -18,6 +18,14 @@ X-User-Role: Admin
   "price": 29.90
 }
 
+### Busca fuzzy (503 se o OpenSearch estiver desligado)
+GET {{ArcadeLink.Catalog.Api_HostAddress}}/search?q=zeldda
+
+### Reindexar (Admin)
+POST {{ArcadeLink.Catalog.Api_HostAddress}}/admin/search/reindex
+X-User-Id: {{userId}}
+X-User-Role: Admin
+
 ### Biblioteca do usuário logado
 GET {{ArcadeLink.Catalog.Api_HostAddress}}/library
 X-User-Id: {{userId}}
@@ -44,6 +52,13 @@ Authorization: Bearer {{adminToken}}
   "genre": "Ação",
   "price": 29.90
 }
+
+### [Kong] Busca fuzzy (anônima) — tolera erros de digitação
+GET {{Kong_HostAddress}}/search?q=zeldda&page=1&size=10
+
+### [Kong] Reindexar todos os jogos no OpenSearch — rota protegida (Admin)
+POST {{Kong_HostAddress}}/admin/search/reindex
+Authorization: Bearer {{adminToken}}
 
 ### [Kong] Biblioteca do usuário logado — rota protegida
 GET {{Kong_HostAddress}}/library

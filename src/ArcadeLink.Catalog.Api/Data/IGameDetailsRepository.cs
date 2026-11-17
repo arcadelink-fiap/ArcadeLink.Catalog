@@ -6,4 +6,5 @@ public interface IGameDetailsRepository
 {
     Task<GameDetails?> GetByGameIdAsync(Guid gameId);
     Task UpsertAsync(GameDetails details);
+    Task DeleteByGameIdAsync(Guid gameId);
 }

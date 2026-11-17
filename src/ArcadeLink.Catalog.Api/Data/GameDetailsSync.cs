@@ -38,4 +38,21 @@ public static class GameDetailsSync
             return null;
         }
     }
+
+    public static async Task TryDeleteAsync(
+        IGameDetailsRepository repository,
+        ILogger logger,
+        Guid gameId)
+    {
+        try
+        {
+            await repository.DeleteByGameIdAsync(gameId);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex,
+                "Falha ao remover GameDetails do Mongo para o jogo {GameId} — limpeza é best-effort, requisição segue normalmente",
+                gameId);
+        }
+    }
 }
